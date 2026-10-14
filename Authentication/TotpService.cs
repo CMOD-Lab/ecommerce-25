@@ -1,14 +1,25 @@
-﻿using OtpNet;
+using OtpNet;
+using System;
 using System.Globalization;
+using System.Text;
 using System.Web;
+using Microsoft.Extensions.Caching.Distributed;
 
 namespace EcommerceWebApi.Authentication
 {
     public class TotpService : ITotpService
     {
-        private static long timeWindowUsedCurrent = new();
+        // cz-dotnet-1004: Replaced in-memory static field with Redis-backed IDistributedCache
+        // to ensure TOTP replay-prevention state survives pod restarts and horizontal scaling on EKS.
+        private readonly IDistributedCache _distributedCache;
+        private const string TotpWindowCacheKeyPrefix = "totp:timewindow:";
 
         private const string issuer = "EcommerceWebApi";
+
+        public TotpService(IDistributedCache distributedCache)
+        {
+            _distributedCache = distributedCache;
+        }
 
         public string GenerateBase32Secret()
         {
@@ -89,12 +100,31 @@ namespace EcommerceWebApi.Authentication
                     VerificationWindow.RfcSpecifiedNetworkDelay
                 );
 
-                // Check if TOTP has been used
-                if (timeWindowUsedCurrent == timeWindowUsed)
+                // cz-dotnet-1004: Check if TOTP has been used via Redis-backed distributed cache
+                // instead of in-memory static field, enabling replay-prevention across all pods.
+                string cacheKey = $"{TotpWindowCacheKeyPrefix}{base32Secret}";
+                var cachedWindowBytes = _distributedCache.Get(cacheKey);
+                long cachedTimeWindow = cachedWindowBytes != null
+                    ? BitConverter.ToInt64(cachedWindowBytes, 0)
+                    : 0L;
+
+                if (cachedTimeWindow == timeWindowUsed)
                 {
                     return false;
                 }
-                timeWindowUsedCurrent = timeWindowUsed;
+
+                // cz-dotnet-1004: Persist used time window to Redis (ElastiCache) instead of
+                // in-memory static field so all pod replicas share the same replay-prevention state.
+                var timeWindowBytes = BitConverter.GetBytes(timeWindowUsed);
+                _distributedCache.Set(
+                    cacheKey,
+                    timeWindowBytes,
+                    new DistributedCacheEntryOptions
+                    {
+                        // TOTP window is 30 seconds; keep entry for 2 minutes to cover clock skew
+                        AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(2)
+                    }
+                );
 
                 return verify;
             }
@@ -106,11 +136,12 @@ namespace EcommerceWebApi.Authentication
 
         public static DateTime GetNistTime()
         {
-            // Get UTC time from the response header of request to "http://www.google.com"
+            // Get UTC time from the response header of request to the configured time server URL
+            string timeServerUrl = Environment.GetEnvironmentVariable("TIME_SERVER_URL") ?? "http://www.google.com";
             using var httpClient = new HttpClient();
             try
             {
-                using var response = httpClient.GetAsync("http://www.google.com").Result;
+                using var response = httpClient.GetAsync(timeServerUrl).Result;
                 if (response.IsSuccessStatusCode && response.Headers.Date != null)
                 {
                     return DateTime.ParseExact(

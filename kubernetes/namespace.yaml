@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ecommercewebapi
+  labels:
+    name: ecommercewebapi
+    app: ecommercewebapi
+    managed-by: kubectl

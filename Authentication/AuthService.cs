@@ -1,6 +1,8 @@
-﻿using EcommerceWebApi.Entities;
+using EcommerceWebApi.Entities;
 using EcommerceWebApi.Services;
+using Microsoft.Extensions.Caching.Distributed;
 using System.Security.Cryptography;
+using System.Text.Json;
 
 namespace EcommerceWebApi.Authentication
 {
@@ -9,13 +11,64 @@ namespace EcommerceWebApi.Authentication
         private readonly IUserService _userService;
         private readonly ITotpService _totpService;
         private readonly IJwtService _jwtService;
-        public User CurrentUser { get; internal set; } = null!;
+        // cz-dotnet-1004: Replaced in-memory CurrentUser property with Redis-backed IDistributedCache
+        // so circuit/session state survives pod restarts and horizontal scaling on EKS with ElastiCache.
+        private readonly IDistributedCache _distributedCache;
+        private const string CurrentUserCacheKeyPrefix = "auth:currentuser:";
 
-        public AuthService(UserService userService, TotpService totpService, JwtService jwtService)
+        public User CurrentUser
+        {
+            get
+            {
+                // Retrieve current user from Redis distributed cache instead of in-memory field
+                var httpContextAccessor = _httpContextAccessor.HttpContext;
+                if (httpContextAccessor == null) return null!;
+                var sessionId = httpContextAccessor.Request.Cookies["session_id"] ?? httpContextAccessor.TraceIdentifier;
+                var cacheKey = $"{CurrentUserCacheKeyPrefix}{sessionId}";
+                var cachedBytes = _distributedCache.Get(cacheKey);
+                if (cachedBytes == null) return null!;
+                return JsonSerializer.Deserialize<User>(cachedBytes)!;
+            }
+            internal set
+            {
+                // Persist current user to Redis distributed cache instead of in-memory field
+                var httpContextAccessor = _httpContextAccessor.HttpContext;
+                if (httpContextAccessor == null) return;
+                var sessionId = httpContextAccessor.Request.Cookies["session_id"] ?? httpContextAccessor.TraceIdentifier;
+                var cacheKey = $"{CurrentUserCacheKeyPrefix}{sessionId}";
+                if (value == null)
+                {
+                    _distributedCache.Remove(cacheKey);
+                }
+                else
+                {
+                    var bytes = JsonSerializer.SerializeToUtf8Bytes(value);
+                    _distributedCache.Set(
+                        cacheKey,
+                        bytes,
+                        new DistributedCacheEntryOptions
+                        {
+                            AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(30)
+                        }
+                    );
+                }
+            }
+        }
+
+        private readonly IHttpContextAccessor _httpContextAccessor;
+
+        public AuthService(
+            UserService userService,
+            TotpService totpService,
+            JwtService jwtService,
+            IDistributedCache distributedCache,
+            IHttpContextAccessor httpContextAccessor)
         {
             _userService = userService;
             _totpService = totpService;
             _jwtService = jwtService;
+            _distributedCache = distributedCache;
+            _httpContextAccessor = httpContextAccessor;
         }
 
         public enum AuthResult
@@ -28,6 +81,8 @@ namespace EcommerceWebApi.Authentication
             Fail
         }
 
+        // cz-dotnet-1004: CheckPassword remains a pure static helper (no circuit state);
+        // the in-memory circuit state was in CurrentUser which is now Redis-backed above.
         private static bool CheckPassword(User user, string password)
         {
             using HMACSHA512? hmac = new(key: user.PasswordSalt);

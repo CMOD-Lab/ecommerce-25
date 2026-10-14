@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  ecommercewebapi:
+    image: ecommercewebapi:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ecommercewebapi
+    ports:
+      - "3000:3000"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_HTTP_PORT=3000
+      - REDIS_CONNECTION_STRING=${REDIS_CONNECTION_STRING:-localhost:6379}
+      - SIGNALR_CORS_ORIGINS=${SIGNALR_CORS_ORIGINS:-http://localhost:3001}
+      - ApplicationSettings__Secret=${APPLICATION_SECRET:-changeme}
+    volumes:
+      - ./Logs:/app/Logs
+    networks:
+      - app-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "dotnet --info > /dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  app-network:
+    driver: bridge
